@@ -1,6 +1,8 @@
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Threading;
+using System.Threading.Tasks;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Plugins;
 using MediaBrowser.Controller.Subtitles;
@@ -14,7 +16,6 @@ namespace Jellyfin.Plugin.OpenSubtitles;
 /// </summary>
 public class PluginServiceRegistrator : IPluginServiceRegistrator
 {
-    /// <inheritdoc />
     public void RegisterServices(IServiceCollection serviceCollection, IServerApplicationHost applicationHost)
     {
         serviceCollection.AddHttpClient(nameof(OpenSubtitles), c =>
@@ -31,9 +32,11 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         })
         .ConfigurePrimaryHttpMessageHandler(sp =>
         {
+            // Thread-safe rate limit handler
             var rateLimitHandler = new ClientSideRateLimitedHandler(
                 sp.GetRequiredService<ILogger<ClientSideRateLimitedHandler>>());
 
+            // Keep gzip/deflate decompression
             rateLimitHandler.InnerHandler = new HttpClientHandler
             {
                 AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
@@ -43,5 +46,32 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         });
 
         serviceCollection.AddSingleton<ISubtitleProvider, OpenSubtitleDownloader>();
+    }
+}
+
+/// <summary>
+/// Thread-safe rate-limited handler for parallel requests.
+/// </summary>
+public class ClientSideRateLimitedHandler : DelegatingHandler
+{
+    private static readonly SemaphoreSlim _semaphore = new(2); // max 2 parallel requests
+    private readonly ILogger<ClientSideRateLimitedHandler> _logger;
+
+    public ClientSideRateLimitedHandler(ILogger<ClientSideRateLimitedHandler> logger)
+    {
+        _logger = logger;
+    }
+
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        await _semaphore.WaitAsync(cancellationToken);
+        try
+        {
+            return await base.SendAsync(request, cancellationToken);
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 }
